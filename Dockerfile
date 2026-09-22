@@ -292,8 +292,8 @@ ARG VLLM_SOURCE_COMMIT=""
 
 # Pinned while investigating an SM121 DeepSeek-V4 MXFP4 grouped scale-factor
 # regression first observed at nv_dev f8e8fb5 (PR #384); last known good.
-ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
+ARG DEEPGEMM_REPO=https://github.com/Nebq29/DeepGEMM.git
+ARG DEEPGEMM_REF=thor-sm110
 ENV DEEPGEMM_SRC_DIR=/workspace/DeepGEMM
 
 # The upstream repository uses the shared checkout cache. Custom repositories

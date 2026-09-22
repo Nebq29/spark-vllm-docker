@@ -1,0 +1,390 @@
+diff --git a/csrc/apis/attention.hpp b/csrc/apis/attention.hpp
+index a737b24..c5c5678 100644
+--- a/csrc/apis/attention.hpp
++++ b/csrc/apis/attention.hpp
+@@ -65,7 +65,7 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
+     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat and std::get<1>(recipe.value()) != 1) {
+         const auto major_sfb = get_major_type_ab(sfb);
+         sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, epilogue_type);
+-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
++    } else if ((arch_major == 10 or arch_major == 11) and sfa.scalar_type() == torch::kInt) {
+         // NOTES: Only granularity 128 and FP8 are exposed in the API
+         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
+                                 128, 128, major_a, major_b, compiled_dims, epilogue_type);
+@@ -176,7 +176,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
+     if (weights_is_f16) {
+         // FP16 weights select the SM100 2-CTA FP16 kernel, which tiles the query dimension
+         // in `block_q * 2` chunks (no per-row bound check), so the output is padded accordingly
+-        DG_HOST_ASSERT(arch_major == 10 and "FP16 weights MQA logits requires SM100 (arch 10)");
++        DG_HOST_ASSERT((arch_major == 10 or arch_major == 11) and "FP16 weights MQA logits requires SM100 (arch 10)");
+         DG_HOST_ASSERT(seq_len % 4 == 0 and "FP16 weights MQA logits requires seq_len % 4 == 0");
+         aligned_seq_len = align(seq_len, block_q * 2);
+     }
+@@ -193,7 +193,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
+     }
+ 
+     // Dispatch implementation
+-    if (is_fp4 and arch_major == 10) {
++    if (is_fp4 and (arch_major == 10 or arch_major == 11)) {
+         sm100_fp4_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                              seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+     } else if (is_fp4 and arch_major == 12) {
+@@ -203,7 +203,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
+         // FP16 weights -> FP16 MMA accumulator (Q*K score + per-head reduction in FP16); see note above
+         sm100_fp8_mqa_logits_f16_weights(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                                          seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+-    } else if (not is_fp4 and (arch_major == 9 or arch_major == 10 or arch_major == 12)) {
++    } else if (not is_fp4 and (arch_major == 9 or (arch_major == 10 or arch_major == 11) or arch_major == 12)) {
+         smxx_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                             seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+     } else {
+@@ -235,7 +235,7 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
+     const auto arch_major = device_runtime->get_arch_major();
+     if (is_varlen) {
+         const auto& indices_tensor = indices.value();
+-        DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and next_n == 1 and (block_kv == 64 or block_kv == 32));
++        DG_HOST_ASSERT(((arch_major == 10 or arch_major == 11) or arch_major == 12) and next_n == 1 and (block_kv == 64 or block_kv == 32));
+         DG_HOST_ASSERT(indices_tensor.dim() == 1 and indices_tensor.size(0) == batch_size);
+         DG_HOST_ASSERT(indices_tensor.is_contiguous());
+         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
+@@ -243,7 +243,7 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
+         smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv,
+                                        num_sms, is_context_lens_2d, /*num_next_n_atoms=*/1,
+                                        /*is_varlen=*/true, indices_tensor.data_ptr<int>());
+-    } else if (arch_major == 9 or arch_major == 10 or arch_major == 12) {
++    } else if (arch_major == 9 or (arch_major == 10 or arch_major == 11) or arch_major == 12) {
+         DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
+         // SM90 schedules in units of `kComputeBlockKV = 64` regardless of physical
+         // `block_kv`; pass the compute block size to the metadata kernel.
+@@ -383,7 +383,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
+     const auto arch_major = device_runtime->get_arch_major();
+     const auto indices_tensor = indices.value_or(torch::Tensor());
+     if (is_varlen) {
+-        DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and next_n == 1);
++        DG_HOST_ASSERT(((arch_major == 10 or arch_major == 11) or arch_major == 12) and next_n == 1);
+         DG_HOST_ASSERT(indices_tensor.dim() == 1 and indices_tensor.size(0) == batch_size);
+         DG_HOST_ASSERT(indices_tensor.is_contiguous());
+         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
+@@ -415,7 +415,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
+     DG_HOST_ASSERT(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16);
+ 
+     // Dispatch implementation
+-    if (is_fp4 and arch_major == 10) {
++    if (is_fp4 and (arch_major == 10 or arch_major == 11)) {
+         sm100_fp4_paged_mqa_logits(q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
+                                    logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
+                                    is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
+@@ -423,7 +423,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
+         sm120_fp4_paged_mqa_logits(q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
+                                    logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
+                                    is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
+-    } else if (not is_fp4 and (arch_major == 9 or arch_major == 10 or arch_major == 12)) {
++    } else if (not is_fp4 and (arch_major == 9 or (arch_major == 10 or arch_major == 11) or arch_major == 12)) {
+         smxx_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
+                                   logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
+                                   is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
+diff --git a/csrc/apis/einsum.hpp b/csrc/apis/einsum.hpp
+index 3ee8836..040d215 100644
+--- a/csrc/apis/einsum.hpp
++++ b/csrc/apis/einsum.hpp
+@@ -56,7 +56,7 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
+         sm90_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
+     } else if (arch_major == 12) {
+         sm120_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+@@ -81,7 +81,7 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
+         sm90_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
+     } else if (arch_major == 12) {
+         sm120_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+@@ -106,7 +106,7 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
+         sm90_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
+     } else if (arch_major == 12) {
+         sm120_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+@@ -212,7 +212,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
+     // Dispatch implementation
+     if (arch_major == 12) {
+         sm120_fp8_fp4_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+     } else {
+         const auto major_sfb = get_major_type_ab(sfb);
+diff --git a/csrc/apis/gemm.hpp b/csrc/apis/gemm.hpp
+index 89a8f49..c3b75ec 100644
+--- a/csrc/apis/gemm.hpp
++++ b/csrc/apis/gemm.hpp
+@@ -164,7 +164,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+         return;
+ 
+     // Dispatch into different arch implementations
+-    if (arch_major == 9 or arch_major == 10) {
++    if (arch_major == 9 or (arch_major == 10 or arch_major == 11)) {
+         // SM90/SM100 share the "transform scaling factors, then dispatch" flow.
+         const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+             a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+@@ -177,7 +177,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                 const auto major_sfb = get_major_type_ab(sfb);
+                 sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+             }
+-        } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
++        } else if ((arch_major == 10 or arch_major == 11) and sfa.scalar_type() == torch::kInt) {
+             sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+                                     major_a, major_b, compiled_dims);
+         } else {
+@@ -287,7 +287,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor,
+         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
+                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
+                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
++    } else if ((arch_major == 10 or arch_major == 11) and sfa.scalar_type() == torch::kInt) {
+         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
+                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
+                                                      compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+@@ -358,7 +358,7 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
+         const auto major_sfb = get_major_type_ab(sfb);
+         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
+                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
+-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
++    } else if ((arch_major == 10 or arch_major == 11) and sfa.scalar_type() == torch::kInt) {
+         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
+                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
+                                                  major_a, major_b, compiled_dims);
+@@ -408,7 +408,7 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
+ 
+     // Dispatch implementation
+     const auto arch_major = device_runtime->get_arch_major();
+-    if (arch_major == 10) {
++    if ((arch_major == 10 or arch_major == 11)) {
+         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks, ks_tensor, gran_k,
+                                       cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
+     } else if (arch_major == 12) {
+@@ -513,7 +513,7 @@ static void bf16_gemm_nt(const torch::Tensor& a,
+     const auto arch_major = device_runtime->get_arch_major();
+     if (arch_major == 9) {
+         sm90_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
+     } else if (arch_major == 12) {
+         sm120_bf16_gemm(sm120_to_k_major(a, major_a, m), sm120_to_k_major(b, major_b, n),
+@@ -592,7 +592,7 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
+         sm90_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
+                                             num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                             use_psum_layout, expected_m_for_psum_layout);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
+                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
+                                              use_psum_layout, expected_m_for_psum_layout);
+@@ -643,7 +643,7 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
+     if (arch_major == 9) {
+         sm90_bf16_m_grouped_gemm_masked(a, b, d, masked_m,
+                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
+                                          num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+     } else if (arch_major == 12) {
+@@ -683,7 +683,7 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
+     if (arch_major == 9) {
+         sm90_bf16_k_grouped_gemm(a, b, c, d, m, n, ks, ks_tensor,
+                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, ks, ks_tensor,
+                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
+     } else if (arch_major == 12) {
+diff --git a/csrc/apis/hyperconnection.hpp b/csrc/apis/hyperconnection.hpp
+index a695f59..3a0cf8c 100644
+--- a/csrc/apis/hyperconnection.hpp
++++ b/csrc/apis/hyperconnection.hpp
+@@ -53,7 +53,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
+         sm120_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
+     } else if (arch_major == 9) {
+         sm90_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
+-    } else if (arch_major == 10) {
++    } else if ((arch_major == 10 or arch_major == 11)) {
+         sm100_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+diff --git a/csrc/apis/layout.hpp b/csrc/apis/layout.hpp
+index 24dc0e3..483c8a6 100644
+--- a/csrc/apis/layout.hpp
++++ b/csrc/apis/layout.hpp
+@@ -45,7 +45,7 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
+         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
+ 
+     // (FP32, x, gran_k) on SM100/SM120: transform to (INT, 1, gran_k), TMA-aligned and MN-major
+-    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and (arch_major == 10 or arch_major == 12)) {
++    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and ((arch_major == 10 or arch_major == 11) or arch_major == 12)) {
+         DG_HOST_ASSERT(not disable_ue8m0_cast);
+         const auto broadcasted = gran_mn == 1 ? sf :
+                                  sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));
+@@ -53,7 +53,7 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
+     }
+ 
+     // (INT, 1, gran_k) on SM100/SM120: transform to TMA-aligned and MN-major
+-    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and (arch_major == 10 or arch_major == 12))
++    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and ((arch_major == 10 or arch_major == 11) or arch_major == 12))
+         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, true, false, torch::kInt);
+ 
+     DG_HOST_UNREACHABLE("Unknown SF transformation");
+@@ -104,7 +104,7 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
+ 
+     // FP32 on SM100/SM120 → packed UE8M0 [packed_sf_k, mn]
+     // Packing function expects [sf_k, mn]; K-major callers may pass [mn, sf_k]
+-    if (sf.scalar_type() == torch::kFloat and (arch_major == 10 or arch_major == 12)) {
++    if (sf.scalar_type() == torch::kFloat and ((arch_major == 10 or arch_major == 11) or arch_major == 12)) {
+         const auto sf_c = sf.is_contiguous() ? sf : sf.contiguous();
+         int ref_sf_k = 0;
+         for (const auto k: ks)
+@@ -114,7 +114,7 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
+     }
+ 
+     // INT on SM100/SM120
+-    if (sf.scalar_type() == torch::kInt and (arch_major == 10 or arch_major == 12))
++    if (sf.scalar_type() == torch::kInt and ((arch_major == 10 or arch_major == 11) or arch_major == 12))
+         DG_HOST_UNREACHABLE("Unimplemented");
+ 
+     DG_HOST_UNREACHABLE("Unknown cases");
+diff --git a/csrc/apis/mega.hpp b/csrc/apis/mega.hpp
+index aa47e40..dbd433f 100644
+--- a/csrc/apis/mega.hpp
++++ b/csrc/apis/mega.hpp
+@@ -203,7 +203,7 @@ static void fp8_fp4_mega_moe(
+     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+ 
+     // Dispatch into different architectures
+-    if (arch_major == 10) {
++    if ((arch_major == 10 or arch_major == 11)) {
+         sm100_fp8_fp4_mega_moe(y,
+                                l1_acts, l1_acts_sf,
+                                l2_acts, l2_acts_sf,
+diff --git a/csrc/jit_kernels/heuristics/runtime.hpp b/csrc/jit_kernels/heuristics/runtime.hpp
+index c54fbad..1fe2e4f 100644
+--- a/csrc/jit_kernels/heuristics/runtime.hpp
++++ b/csrc/jit_kernels/heuristics/runtime.hpp
+@@ -53,7 +53,7 @@ public:
+         if (arch_major == 12)
+             return {128, 64, 64};
+         // SM100: 16-row MMA steps from 240 down to 32
+-        if (arch_major == 10)
++        if ((arch_major == 10 or arch_major == 11))
+             return {240, 32, 16};
+         // SM90 and others: fixed legacy alignment, no shrinking
+         return {kLegacyMKAlignmentForContiguousLayout, kLegacyMKAlignmentForContiguousLayout, 1};
+diff --git a/csrc/jit_kernels/impls/smxx_fp8_fp4_mqa_logits.hpp b/csrc/jit_kernels/impls/smxx_fp8_fp4_mqa_logits.hpp
+index 3fe6e31..eaa7b6e 100644
+--- a/csrc/jit_kernels/impls/smxx_fp8_fp4_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/smxx_fp8_fp4_mqa_logits.hpp
+@@ -98,7 +98,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
+     const int arch_major = device_runtime->get_arch_major();
+     const int num_q_stages = (arch_major == 12 ? 2 : 3);
+     const int num_kv_stages = 3;
+-    const int num_math_threads = (arch_major == 12 ? 256 : (arch_major == 10 ? 256 : 512));
++    const int num_math_threads = (arch_major == 12 ? 256 : ((arch_major == 10 or arch_major == 11) ? 256 : 512));
+     const int num_sms = device_runtime->get_num_sms();
+ 
+     // SM120 split-KV: when there are fewer q-blocks than SMs, split each q-block's
+@@ -273,7 +273,7 @@ static void sm100_fp8_mqa_logits_f16_weights(
+     const int &seq_len_kv, const int &max_seqlen_k, const int &stride_logits,
+     const int &num_heads, const int &head_dim, const int &block_q,
+     const int &block_kv) {
+-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
++    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 or device_runtime->get_arch_major() == 11);
+ 
+     constexpr int num_specialized_threads = 128;
+     constexpr int num_q_stages = 5, num_kv_stages = 8;
+diff --git a/csrc/jit_kernels/impls/smxx_fp8_fp4_paged_mqa_logits.hpp b/csrc/jit_kernels/impls/smxx_fp8_fp4_paged_mqa_logits.hpp
+index 409915a..fa14446 100644
+--- a/csrc/jit_kernels/impls/smxx_fp8_fp4_paged_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/smxx_fp8_fp4_paged_mqa_logits.hpp
+@@ -240,11 +240,11 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
+         num_q_stages = 2;
+         num_kv_stages = 3;
+     } else {
+-        mma_m = (arch_major == 10 ? 128 : 64);
++        mma_m = ((arch_major == 10 or arch_major == 11) ? 128 : 64);
+         num_math_warp_groups = split_kv / mma_m;
+         num_math_threads = num_math_warp_groups * 128;
+         num_q_stages = 3;
+-        num_kv_stages = (arch_major == 10 ? 4 : 3);
++        num_kv_stages = ((arch_major == 10 or arch_major == 11) ? 4 : 3);
+     }
+     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
+ 
+diff --git a/csrc/jit_kernels/impls/smxx_fp8_mqa_logits.hpp b/csrc/jit_kernels/impls/smxx_fp8_mqa_logits.hpp
+index f3b82e3..1adcdc9 100644
+--- a/csrc/jit_kernels/impls/smxx_fp8_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/smxx_fp8_mqa_logits.hpp
+@@ -94,7 +94,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
+     constexpr int block_kv = 256;
+     constexpr int num_specialized_threads = 128;
+     constexpr int num_q_stages = 3, num_kv_stages = 3;
+-    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
++    const int num_math_threads = ((device_runtime->get_arch_major() == 10 or device_runtime->get_arch_major() == 11) ? 256 : 512);
+     const int block_q = block_qh / num_heads;
+     DG_HOST_ASSERT(block_qh % num_heads == 0);
+     DG_HOST_ASSERT(seq_len_alignment % block_q == 0);
+diff --git a/csrc/jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp b/csrc/jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp
+index 1240aad..3400673 100644
+--- a/csrc/jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp
+@@ -176,10 +176,10 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
+                                       const int& num_sms,
+                                       const int& split_kv) {
+     const int num_specialized_threads = 128;
+-    const int mma_m = (device_runtime->get_arch_major() == 10 ? 128 : 64);
++    const int mma_m = ((device_runtime->get_arch_major() == 10 or device_runtime->get_arch_major() == 11) ? 128 : 64);
+     const int num_math_warp_groups = split_kv / mma_m;
+     const int num_math_threads = num_math_warp_groups * 128;
+-    const int num_q_stages = 3, num_kv_stages = (device_runtime->get_arch_major() == 10 ? 4 : 3);
++    const int num_q_stages = 3, num_kv_stages = ((device_runtime->get_arch_major() == 10 or device_runtime->get_arch_major() == 11) ? 4 : 3);
+     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
+ 
+     // Construct TMAs
+diff --git a/csrc/utils/layout.hpp b/csrc/utils/layout.hpp
+index 9e3c0d7..4b0c9c5 100644
+--- a/csrc/utils/layout.hpp
++++ b/csrc/utils/layout.hpp
+@@ -45,7 +45,7 @@ static auto get_shape(const torch::Tensor& t) {
+ static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
+     auto [mn, k] = get_shape<2>(ab);
+     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
+-        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and (arch_major == 10 or arch_major == 12));
++        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and ((arch_major == 10 or arch_major == 11) or arch_major == 12));
+         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
+     }
+     return std::make_tuple(mn, k);
+@@ -54,7 +54,7 @@ static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute
+ static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
+     auto [num_groups, mn, k] = get_shape<3>(ab);
+     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
+-        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and (arch_major == 10 or arch_major == 12));
++        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and ((arch_major == 10 or arch_major == 11) or arch_major == 12));
+         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
+     }
+     return std::make_tuple(num_groups, mn, k);
+@@ -67,7 +67,7 @@ get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType&
+     if (arch_major == 9) {
+         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
+         return {1, 128, 128};
+-    } else if (arch_major == 10 or arch_major == 12) {
++    } else if ((arch_major == 10 or arch_major == 11) or arch_major == 12) {
+         DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt);
+         return sfb_dtype == torch::kFloat ?
+             std::make_tuple(1, 128, 128):   // Legacy format

@@ -1320,7 +1320,7 @@ get_env_flags() {
         "UCX_NET_DEVICES=$ETH_IF" \
         "NCCL_SOCKET_IFNAME=$ETH_IF" \
         "NCCL_IB_HCA=$IB_IF" \
-        "NCCL_IB_DISABLE=0" \
+        "NCCL_IB_DISABLE=1" \
         "OMPI_MCA_btl_tcp_if_include=$ETH_IF" \
         "GLOO_SOCKET_IFNAME=$ETH_IF" \
         "TP_SOCKET_IFNAME=$ETH_IF" \
