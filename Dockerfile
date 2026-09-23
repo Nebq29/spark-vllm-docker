@@ -382,13 +382,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-# Optional upstream PR patches requested by the build wrapper. PR #54788 makes
-# Model Runner V2 honor an MTP/EAGLE draft's explicit MoE backend instead of
-# inheriting the quantized target's incompatible backend. Remove it once the fix
-# is present in the oldest vLLM ref used by regular builds. PR #47392 is carried
-# as a source-aware runtime patch below because its full diff now conflicts with
-# current upstream main.
-ARG VLLM_PRESET_PRS="54788"
+ARG VLLM_PRESET_PRS=""
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
@@ -851,6 +845,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     else \
         echo "B12X installation not requested; skipping."; \
     fi
+
+# Validate cached CuTe objects and recover from interrupted writes. Apply after
+# both source and PyPI B12X installs so every model/backend gets the same fix.
+COPY docker/patch_b12x_cache_integrity.py docker/b12x-cache-integrity.patch /tmp/b12x-patches/
+RUN python3 /tmp/b12x-patches/patch_b12x_cache_integrity.py --installed
 
 # Cached or downloaded wheels can predate the CUDA-on-WSL reporting fix.
 # This also accepts wheels that already contain the source-stage patch.
