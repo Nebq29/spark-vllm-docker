@@ -1,61 +1,83 @@
-# Recipe: DeepSeek V4 Flash
-# DeepSeek V4 Flash with sparse MLA/DeepGEMM experimental SM120 support
+# Recipe: DeepSeek V4 Flash — 2x Jetson Thor (SM110) TP=2
+#
+# Validated config for the dual-Thor cluster (thorc1 + thorc2, 10GbE TP rail).
+# Build the image first:
+#   docker build -f mods/thor-sm110/Dockerfile -t thor-dsv4:latest .
+# Then use scripts/thor_rank{1,0}_spec_k4_ll128.sh (rank1 first, rank0 ~30s later)
+# or the command below via run-recipe.py.
+#
+# Measured: ~44 tok/s decode (DSpark k=4, accept len 3.36), ~735 tok/s cold prefill.
+# Network prerequisites: jumbo MTU 8966 on mgbe0_0 (scripts/set_jumbo_tp.sh),
+# NCCL_PROTO=LL128. Launch rank1 (node .230) BEFORE rank0 (node .24).
 
 recipe_version: "1"
-name: DeepSeek-V4-Flash
-description: vLLM serving deepseek-ai/DeepSeek-V4-Flash on a DGX Spark cluster
+name: DeepSeek-V4-Flash-Thor
+description: vLLM serving DeepSeek-V4-Flash-0731 on 2x Jetson Thor (SM110), TP=2 over 10GbE
 
-# HuggingFace model to download (optional, for --download-model)
 model: /models/DeepSeek-V4-Flash-0731
-
-# Container image to use
-container: vllm-node
-
-# Can only be run in a cluster
+container: thor-dsv4
 cluster_only: true
 
-# No mods required
-mods: []
+mods:
+  - mods/thor-sm110
 
-# Default settings (can be overridden via CLI where supported)
 defaults:
-  port: 8000
+  port: 19038
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.8
-  max_model_len: 500000
-  block_size: 256
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
   max_num_seqs: 4
-  max_num_batched_tokens: 8192
-  num_speculative_tokens: 5
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 4
 
-# Environment variables
+# Serving-critical environment. Do not trim:
+#  - VLLM_USE_DEEP_GEMM=0 / VLLM_MOE_USE_DEEP_GEMM=0: DeepGEMM has no
+#    sm_110 path for this checkpoint's layouts; Triton fallbacks are the
+#    serving path (installed by the mods overlay).
+#  - NCCL_PROTO=LL128: removes the 32KB small-message knee on the 10GbE
+#    TP rail (-34% per-collective at k=3/k=4 payload sizes).
+#  - NCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME = mgbe0_0: the TP rail.
+#  - TORCH_CUDA_ARCH_LIST=11.0a: Thor sm_110a JIT target.
 env:
-  DG_JIT_USE_NVRTC: "0"
-  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-  VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+  NCCL_SOCKET_IFNAME: mgbe0_0
+  NCCL_PROTO: LL128
+  GLOO_SOCKET_IFNAME: mgbe0_0
+  VLLM_USE_DEEP_GEMM: "0"
+  VLLM_MOE_USE_DEEP_GEMM: "0"
+  VLLM_DEEP_GEMM_WARMUP: skip
+  VLLM_ALLREDUCE_USE_FLASHINFER: "0"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "64"
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+  VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: "512"
+  CUDA_MODULE_LOADING: LAZY
+  TORCH_NCCL_USE_COMM_NONBLOCKING: "0"
+  TORCH_ALLOW_TF32_CUBLAS_OVERRIDE: "1"
+  OPENBLAS_CORETYPE: NEOVERSEV2
+  TORCH_CUDA_ARCH_LIST: "11.0a"
 
-# The vLLM serve command template
 command: |
   vllm serve /models/DeepSeek-V4-Flash-0731 \
       --host {host} \
       --port {port} \
+      --served-model-name deepseek-v4-flash \
       --trust-remote-code \
-      --tensor-parallel-size {tensor_parallel} \
-      --kv-cache-dtype fp8 \
-      --block-size {block_size} \
+      --tokenizer-mode deepseek_v4 \
       --max-model-len {max_model_len} \
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
+      --load-format safetensors \
+      --safetensors-load-strategy lazy \
       --gpu-memory-utilization {gpu_memory_utilization} \
-      --enable-prefix-caching \
-      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"greedy"}}' \
-      --tokenizer-mode deepseek_v4 \
-      --distributed-executor-backend ray \
-      --tool-call-parser deepseek_v4 \
-      --enable-auto-tool-choice \
-      --reasoning-parser deepseek_v4 \
-      --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}}' \
-      --default-chat-template-kwargs.thinking=true \
-      --default-chat-template-kwargs.reasoning_effort=high \
-      --load-format instanttensor
+      --kv-cache-dtype fp8 \
+      --attention-backend THOR_MLA_SPARSE_DSV4 \
+      --linear-backend triton \
+      --moe-backend marlin \
+      --compilation-config '{"cudagraph_capture_sizes":[1,2,4,5,6,8,12,16],"cudagraph_num_of_warmups":1}' \
+      --speculative-config '{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic"}' \
+      --distributed-executor-backend mp \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size 1 \
+      --enable-expert-parallel \
+      --enable-ep-weight-filter \
+      --all2all-backend allgather_reducescatter
