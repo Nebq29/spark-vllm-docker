@@ -31,13 +31,27 @@ DeepGEMM Thor arch dispatch is in **Nebq29/DeepGEMM** branch `thor-sm110`
    The build self-verifies: Thor backend import + 7-config count gate.
 4. **Model**: place `DeepSeek-V4-Flash-0731` under `/models/` (or adjust
    the bind mount in the launch scripts).
-5. **Network** (both nodes, one time, survives reboot):
-   `sudo bash scripts/set_jumbo_tp.sh 1` on the .1-node, `2` on the .2-node
-   (MTU 8966 on the TP rail `mgbe0_0`).
-6. **Launch**: rank1 (worker node) FIRST, wait ~30 s, then rank0 (head).
+5. **Network** (both nodes, one time, survives reboot): install
+   `mods/thor-sm110/net/` — `net_tune.sh` + `nvethernet_ensure_fixed.sh` +
+   `nvethernet_rx_lost_irq.patch` (build the patched nvethernet.ko first;
+   build-id `08bf9206…`), then enable
+   `forecr-net-tune.service` (unit text in `mods/thor-sm110/net/README.md`).
+   This sets MTU 8966, `rx-usecs 8 rx-frames 1`, **RX ring 16384**,
+   threaded NAPI, DMA-FQ, CPU `scaling_min` pin, lane IRQ spread (lane N ->
+   cpu N+1), and GPU devfreq pins (gpc 1575 / nvd 1692).
+   Verify: `ping -M do -s 8972 <peer>` = 0% loss; `ethtool -c mgbe0_0`
+   shows rx-frames 1; `nstat TcpRetransSegs` stays flat under load.
+6. **lanex** (optional, +15-17% prefill): build
+   `mods/thor-sm110/lanex/` per its README, deploy to `~/lanex/` on both
+   boards, launch with the env in `scripts/thor_rank{0,1}_dg_spec_k4_ll128.sh`
+   (`LANEX_ENABLE=1 LANEX_ASYNC=1 LANEX_HOSTBUF=hostmem
+   LANEX_HOSTMEM_ALLOC=mmap LANEX_HOSTMEM_THP=huge LANEX_SOCKBUF=0`).
+7. **Launch**: rank1 (worker node) FIRST, wait ~30 s, then rank0 (head).
    `bash scripts/thor_rank1_spec_k4_ll128.sh` then `bash scripts/thor_rank0_spec_k4_ll128.sh`
-7. **Verify**: `curl http://<head>:19038/health` → 200; model id
-   `deepseek-v4-flash`.
+8. **Verify**: `curl http://<head>:19038/health` → 200; model id
+   `deepseek-v4-flash`. Decode should be ~44-46 tok/s (lanex+tuned rail);
+   if it's 8-16 tok/s, suspect RX ring overflow or unpinned clocks (see
+   `mods/thor-sm110/net/README.md` gotchas 1-2-4).
 
 ## Critical flags (do not trim — each fixes a measured failure)
 

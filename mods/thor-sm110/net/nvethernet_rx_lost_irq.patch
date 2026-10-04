@@ -1,0 +1,47 @@
+--- a/ether_linux.c
++++ b/ether_linux.c
+@@ -5218,12 +5218,44 @@
+ 	received = osi_process_rx_completions(osi_dma, chan, budget,
+ 					      &more_data_avail);
+ 	if (received < budget) {
++		struct osi_rx_ring *rx_ring = osi_dma->rx_ring[chan];
++
+ 		napi_complete(napi);
+ 		raw_spin_lock_irqsave(&pdata->rlock, flags);
+ 		osi_handle_dma_intr(osi_dma, chan,
+ 				    OSI_DMA_CH_RX_INTR,
+ 				    OSI_DMA_INTR_ENABLE);
+ 		raw_spin_unlock_irqrestore(&pdata->rlock, flags);
++
++		/*
++		 * Close the lost RX interrupt race: a frame that completes
++		 * after the last ring check above but before the channel
++		 * interrupt is re-enabled leaves RI latched with no new
++		 * edge, so the channel goes silent until some other event
++		 * services it (observed on T26X MGBE as multi-second TCP
++		 * stalls). If the next descriptor already holds a new frame,
++		 * re-arm NAPI instead of waiting for an interrupt.
++		 */
++		if (likely(rx_ring != NULL)) {
++			struct osi_rx_desc *rx_desc =
++				rx_ring->rx_desc + rx_ring->cur_rx_idx;
++			struct osi_rx_swcx *rx_swcx =
++				rx_ring->rx_swcx + rx_ring->cur_rx_idx;
++
++			dma_rmb();
++			if (((READ_ONCE(rx_desc->rdes3) & BIT(31)) == 0U) &&
++			    ((READ_ONCE(rx_swcx->flags) &
++			      OSI_RX_SWCX_PROCESSED) == 0U) &&
++			    napi_schedule_prep(napi)) {
++				raw_spin_lock_irqsave(&pdata->rlock, flags);
++				osi_handle_dma_intr(osi_dma, chan,
++						    OSI_DMA_CH_RX_INTR,
++						    OSI_DMA_INTR_DISABLE);
++				raw_spin_unlock_irqrestore(&pdata->rlock,
++							   flags);
++				__napi_schedule(napi);
++			}
++		}
+ 	}
+ 
+ 	return received;
