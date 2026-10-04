@@ -1,0 +1,43 @@
+# Thor SM110 DSv4-Flash + DeepGEMM MoE variant
+#
+# Adds the validated DeepGEMM MoE serving path (round 9) on top of the
+# standard thor-dsv4 image WITHOUT modifying it: the wheel is installed at
+# container start and the six gate files are bind-mounted over the image's
+# copies. See mods/thor-sm110/dg/README.md for the measured numbers and
+# the exact launch flags.
+#
+# Build (on a Thor board, from this directory; expects
+# deep_gemm-2.5.0+ee84db0-cp312-cp312-linux_aarch64.whl alongside):
+#   docker build -f Dockerfile.dg -t thor-dsv4-dg:latest .
+#
+# The wheel itself is built from Nebq29/DeepGEMM@thor-sm110 inside the
+# base image with:
+#   git submodule update --init --recursive
+#   C_INCLUDE_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include \
+#   CPLUS_INCLUDE_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include \
+#   pip wheel . --no-build-isolation
+# (the image's /usr/local/cuda lacks cusparse.h; the pip package tree has it)
+
+FROM thor-dsv4:latest
+
+# Gate files + wheel land in the image itself (baked variant). For the
+# bind-mount workflow used during validation, see dg/README.md — the same
+# files mounted with -v achieve the identical result without a rebuild.
+COPY deep_gemm-2.5.0+ee84db0-cp312-cp312-linux_aarch64.whl /tmp/dg.whl
+RUN pip install --no-cache-dir /tmp/dg.whl && rm /tmp/dg.whl
+
+COPY patches/cuda_patched.py /usr/local/lib/python3.12/dist-packages/vllm/platforms/cuda.py
+COPY patches/deep_gemm_mod_patched.py /usr/local/lib/python3.12/dist-packages/vllm/utils/deep_gemm.py
+COPY patches/import_utils_dg_patched.py /usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py
+COPY patches/sparse_attn_indexer_dg.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
+COPY patches/tilelang_dg.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/mhc/tilelang.py
+COPY patches/deep_gemm_moe_patched.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+
+# Sanity gate: the DeepGEMM path must resolve to the installed wheel, not
+# the vendored copy, and the Thor gate must be open.
+RUN VLLM_USE_DEEP_GEMM=1 python3 -c "\
+from vllm.utils.deep_gemm import is_deep_gemm_supported, is_scale_up_ue8m0;\
+assert is_deep_gemm_supported(), 'Thor DeepGEMM gate did not open';\
+import deep_gemm;\
+assert 'third_party' not in deep_gemm.__file__, f'resolved to vendored: {deep_gemm.__file__}';\
+print('DG gate OK; deep_gemm at', deep_gemm.__file__)"
