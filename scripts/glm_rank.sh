@@ -31,7 +31,7 @@ docker run -d --name $NAME \
   -v /tmp:/tmp \
   -v /home/nebq29/patches/tilelang_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/mhc/tilelang.py:ro \
   -v /home/nebq29/patches/dg/import_utils_dg_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py:ro \
-  -v /home/nebq29/dg_wheel:/wheels:ro \
+  -v ${DG_WHEEL_DIR:-/home/nebq29/dg_wheel_ee84db0}:/wheels:ro \
   -v /home/nebq29/thor-cache/deep_gemm:/root/.dg_cache \
   --network host --ipc host --shm-size 8g --runtime nvidia --gpus all \
   -e NCCL_SOCKET_IFNAME=mgbe0_0 \
@@ -58,7 +58,8 @@ docker run -d --name $NAME \
     --max-model-len 32768 --max-num-batched-tokens 8192 --max-num-seqs 4 \
     --gpu-memory-utilization 0.90 \
     --load-format safetensors --safetensors-load-strategy lazy \
-    --attention-backend THOR_MLA_SPARSE_DSV4 \
+    --kv-cache-dtype ${KV_DTYPE:-bfloat16} \
+    ${ATTN_BACKEND:+--attention-backend $ATTN_BACKEND} \
     --reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice \
     --compilation-config '$COMP' \
     ${SPEC:+--speculative-config '$SPEC'} \
