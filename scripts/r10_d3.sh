@@ -30,7 +30,8 @@ MOUNTS="-v /home/nebq29/thor-cache/deep_gemm:/root/.dg_cache \
   -v /home/nebq29/patches/dg/import_utils_dg_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py:ro \
   -v /home/nebq29/patches/dg/sparse_attn_indexer_dg.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro \
   -v /home/nebq29/patches/dg/tilelang_dg.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/mhc/tilelang.py:ro \
-  -v /home/nebq29/patches/dg/deep_gemm_moe_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py:ro"
+  -v /home/nebq29/patches/dg/deep_gemm_moe_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py:ro \
+  -v /home/nebq29/fp8_einsum_patched.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py:ro"
 
 docker run -d --name $NAME \
   -v /home/nebq29/models:/models:ro \
@@ -44,6 +45,7 @@ docker run -d --name $NAME \
   -e GLOO_SOCKET_IFNAME=mgbe0_0 \
   -e VLLM_USE_DEEP_GEMM=1 -e VLLM_MOE_USE_DEEP_GEMM=1 -e DG_JIT_CACHE_DIR=/root/.dg_cache \
   -e DG_JIT_DEBUG=1 \
+  -e DG_EINSUM_DEBUG=${DG_EINSUM_DEBUG:-0} \
   -e LANEX_ENABLE=1 -e LANEX_ASYNC=1 -e LANEX_HOSTBUF=hostmem \
   -e LANEX_HOSTMEM_ALLOC=mmap -e LANEX_HOSTMEM_THP=huge -e LANEX_SOCKBUF=0 \
   -e LANEX_LOCAL_IPS=$LANEX_LOCAL_IPS -e LANEX_PEER_IPS=$LANEX_PEER_IPS \
