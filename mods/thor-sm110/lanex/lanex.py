@@ -98,6 +98,10 @@ _lib.lanex_zc_stats.argtypes = [ctypes.c_void_p,
                                 ctypes.POINTER(ctypes.c_uint64),
                                 ctypes.POINTER(ctypes.c_uint64)]
 LANEX_ZEROCOPY = os.environ.get("LANEX_ZEROCOPY", "0") == "1"
+# LANEX_COMPRESS=int8: exchange int8 blocks of 128 + fp32 scale (~53% of bf16 bytes).
+# hostmem mode, bf16/fp16 only. Not bit-identical to an uncompressed all-reduce, but
+# both ranks get bit-identical results. Default off.
+LANEX_COMPRESS = os.environ.get("LANEX_COMPRESS", "none")
 LANEX_HOSTMEM_ALLOC = os.environ.get("LANEX_HOSTMEM_ALLOC", "malloc")
 LANEX_HOSTMEM_THP = os.environ.get("LANEX_HOSTMEM_THP", "nohuge")
 
@@ -309,8 +313,84 @@ def _triton_kernels():
             # same as torch's add_ for bf16/fp16: add in fp32, round once
             tl.store(x_ptr + offs, (a.to(tl.float32) + b.to(tl.float32)).to(a.dtype), mask=m)
 
-        _tk = (triton, copy_out, add_in)
+        @triton.jit
+        def q8_out(x_ptr, dst_addr, n, soff, G: tl.constexpr, GP: tl.constexpr):
+            # x -> int8 per G-element block + one fp32 scale per block, written to
+            # host memory: data at dst_addr[0:n], scales at dst_addr[soff:soff+4*ngroups]
+            rows = tl.program_id(0) * GP + tl.arange(0, GP)
+            offs = rows[:, None] * G + tl.arange(0, G)[None, :]
+            m = offs < n
+            x = tl.load(x_ptr + offs, mask=m, other=0.0).to(tl.float32)
+            amax = tl.max(tl.abs(x), axis=1)
+            scale = tl.where(amax > 0, amax / 127.0, 1.0)
+            y = x / scale[:, None]
+            q = tl.where(y >= 0, tl.floor(y + 0.5), tl.ceil(y - 0.5))
+            q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+            tl.store(dst_addr.to(tl.pointer_type(tl.int8)) + offs, q.to(tl.int8), mask=m)
+            ng = (n + G - 1) // G
+            tl.store((dst_addr + soff).to(tl.pointer_type(tl.float32)) + rows, scale, mask=rows < ng)
+
+        @triton.jit
+        def q8_add(x_ptr, first_addr, second_addr, n, soff, G: tl.constexpr, GP: tl.constexpr):
+            # x = dequant(first) + dequant(second). Both ranks pass rank 0's data as
+            # `first`, so the arithmetic (including any FMA contraction) is identical
+            # on both ranks and the results are bit-identical.
+            rows = tl.program_id(0) * GP + tl.arange(0, GP)
+            offs = rows[:, None] * G + tl.arange(0, G)[None, :]
+            m = offs < n
+            ng = (n + G - 1) // G
+            rm = rows < ng
+            q1 = tl.load(first_addr.to(tl.pointer_type(tl.int8)) + offs, mask=m, other=0).to(tl.float32)
+            q2 = tl.load(second_addr.to(tl.pointer_type(tl.int8)) + offs, mask=m, other=0).to(tl.float32)
+            s1 = tl.load((first_addr + soff).to(tl.pointer_type(tl.float32)) + rows, mask=rm, other=0.0)
+            s2 = tl.load((second_addr + soff).to(tl.pointer_type(tl.float32)) + rows, mask=rm, other=0.0)
+            out = q1 * s1[:, None] + q2 * s2[:, None]
+            tl.store(x_ptr + offs, out.to(x_ptr.dtype.element_ty), mask=m)
+
+        _tk = (triton, copy_out, add_in, q8_out, q8_add)
     return _tk
+
+
+Q8_G = 128   # elements per int8 block (one fp32 scale each)
+Q8_GP = 8    # blocks per Triton program
+
+
+def q8_layout(n):
+    """(scale offset, total bytes exchanged) for n elements in int8 mode."""
+    soff = (n + 15) // 16 * 16
+    ng = (n + Q8_G - 1) // Q8_G
+    return soff, soff + 4 * ng
+
+
+def gpu_q8_out(x, host_t):
+    triton, _, _, q8_out, _ = _triton_kernels()
+    n = x.numel()
+    soff, _ = q8_layout(n)
+    ng = (n + Q8_G - 1) // Q8_G
+    q8_out[(triton.cdiv(ng, Q8_GP),)](x, host_t.data_ptr(), n, soff, G=Q8_G, GP=Q8_GP)
+
+
+def gpu_q8_add(x, first_t, second_t):
+    triton, _, _, _, q8_add = _triton_kernels()
+    n = x.numel()
+    soff, _ = q8_layout(n)
+    ng = (n + Q8_G - 1) // Q8_G
+    q8_add[(triton.cdiv(ng, Q8_GP),)](x, first_t.data_ptr(), second_t.data_ptr(), n, soff,
+                                      G=Q8_G, GP=Q8_GP)
+
+
+def q8_roundtrip_ref(x):
+    """Torch reference of what one rank's contribution becomes after int8 blocks
+    (for tests; Triton's fp32 division may differ in the last bit)."""
+    f = x.float().reshape(-1)
+    n = f.numel()
+    pad = (-n) % Q8_G
+    g = torch.nn.functional.pad(f, (0, pad)).view(-1, Q8_G)
+    amax = g.abs().amax(dim=1, keepdim=True)
+    scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+    y = g / scale
+    q = torch.where(y >= 0, torch.floor(y + 0.5), torch.ceil(y - 0.5)).clamp(-127, 127)
+    return (q * scale).reshape(-1)[:n]
 
 
 _BLOCK = 4096
@@ -318,14 +398,14 @@ _BLOCK = 4096
 
 def gpu_copy_out(x, host_t):
     """x (CUDA, contiguous) -> pageable host memory at host_t, on the current stream."""
-    triton, copy_out, _ = _triton_kernels()
+    triton, copy_out = _triton_kernels()[:2]
     n = x.numel()
     copy_out[(triton.cdiv(n, _BLOCK),)](x, host_t.data_ptr(), n, BLOCK=_BLOCK)
 
 
 def gpu_add_in(x, host_t):
     """x += (pageable host memory at host_t viewed as x.dtype), on the current stream."""
-    triton, _, add_in = _triton_kernels()
+    triton, _, add_in = _triton_kernels()[:3]
     n = x.numel()
     add_in[(triton.cdiv(n, _BLOCK),)](x, host_t.data_ptr(), n, BLOCK=_BLOCK)
 
@@ -427,7 +507,14 @@ class LaneX:
         xf = x.view(-1)
 
         # 1. D2H into A
-        if hostmem:
+        xbytes = nbytes
+        q8 = (hostmem and LANEX_COMPRESS == "int8"
+              and x.dtype in (torch.bfloat16, torch.float16)
+              and q8_layout(xf.numel())[1] <= nbytes)
+        if q8:
+            xbytes = q8_layout(xf.numel())[1]
+            gpu_q8_out(xf, A)
+        elif hostmem:
             gpu_copy_out(xf, A)
         elif managed:
             copy_async(A.data_ptr(), x.data_ptr(), nbytes, cur)
@@ -436,7 +523,7 @@ class LaneX:
         # 2. exchange A -> peer, peer -> B
         if LANEX_ASYNC:
             j = self._next_job(cur)
-            j.h, j.a, j.b, j.n = self._h, A.data_ptr(), B.data_ptr(), nbytes
+            j.h, j.a, j.b, j.n = self._h, A.data_ptr(), B.data_ptr(), xbytes
             rc = _lib.lanex_xchg_async(cur.cuda_stream, ctypes.byref(j))
             if rc != 0:
                 raise RuntimeError(f"cuLaunchHostFunc failed rc={rc}")
@@ -449,7 +536,7 @@ class LaneX:
             rc = _lib.lanex_xchg(self._h,
                                  ctypes.cast(A.data_ptr(), ctypes.c_char_p),
                                  ctypes.cast(B.data_ptr(), ctypes.c_char_p),
-                                 nbytes)
+                                 xbytes)
             if rc != 0:
                 raise RuntimeError(f"lanex_xchg failed errno={rc}")
             w, t = ctypes.c_double(), ctypes.c_double()
@@ -458,7 +545,10 @@ class LaneX:
             self._prof_wait += w.value * 1e-6
             self._prof_n += 1
         # 3. H2D peer data to GPU scratch, 4. add on GPU (stream-ordered)
-        if hostmem:
+        if q8:
+            first, second = (A, B) if self.rank == 0 else (B, A)
+            gpu_q8_add(xf, first, second)
+        elif hostmem:
             gpu_add_in(xf, B)  # reads B directly from host memory; no H2D copy
         else:
             if managed:
