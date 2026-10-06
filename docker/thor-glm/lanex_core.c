@@ -235,13 +235,27 @@ lanex_h *lanex_create(int nlanes, const char **local_ips, const char **peer_ips,
     } else {
       struct sockaddr_in pa = {.sin_family = AF_INET, .sin_port = htons(base_port + i)};
       inet_pton(AF_INET, peer_ips[i], &pa.sin_addr);
-      int s = socket(AF_INET, SOCK_STREAM, 0);
-      int ok = 0;
-      for (int t = 0; t < 900; t++) {
+      int ok = 0, s = -1;
+      /* Retry budget: rank0 is the listener but also runs the API server +
+       * multimodal warmup, so it can reach its first all-reduce (and thus
+       * bind/listen) several minutes after rank1 reaches its first
+       * all-reduce. A fixed 90s budget loses that race and rank1 dies with
+       * "lanex_create failed". Make it generous + configurable.
+       * Also: create a FRESH socket per attempt — a socket that has failed
+       * connect() may be poisoned for a second connect() on Linux, so
+       * reusing one burns the whole budget on instant failures. */
+      int retries = 6000;  /* default 6000 x 100ms = 10 min */
+      const char *rt = getenv("LANEX_CONNECT_TIMEOUT_MS");
+      if (rt) { int v = atoi(rt); if (v >= 1000) retries = v / 100; }
+      for (int t = 0; t < retries; t++) {
+        s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) { usleep(100000); continue; }
         if (connect(s, (void *)&pa, sizeof pa) == 0) { ok = 1; break; }
+        close(s);
+        s = -1;
         usleep(100000);
       }
-      if (!ok) { close(s); free(h); return NULL; }
+      if (!ok) { free(h); return NULL; }
       tune(s);
       h->fds[i] = s;
     }
